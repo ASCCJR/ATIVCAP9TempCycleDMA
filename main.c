@@ -43,7 +43,6 @@ volatile bool g_flag_permitir_print = false;    // Sinaliza para o loop principa
 
 // --- Configurações de DMA  ---
 extern dma_channel_config cfg_temp;
-extern int DMA_TEMP_CHANNEL;
 
 // --- Objetos Timer ---
 static repeating_timer_t timer_t1;
