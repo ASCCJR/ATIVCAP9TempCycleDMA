@@ -5,135 +5,154 @@
  * ------------------------------------------------------------
  * Descrição:
  * Ciclo principal do sistema embarcado, baseado em um
- * executor cíclico com 4 tarefas principais, cada uma
- * controlada por seu próprio timer periódico:
+ * executor cíclico com tarefas principais:
  *
- * Tarefa 1 - Leitura da temperatura via DMA (meio segundo)
- * Tarefa 2 - Exibição da temperatura e tendência no OLED
- * Tarefa 3 - Análise da tendência da temperatura
- * Tarefa 4 - Controle da matriz NeoPixel baseada na tendência
+ * Tarefa 1 - Leitura da temperatura via DMA 
+ * Tarefa 2 - Exibição da temperatura e tendência no OLED 
+ * Tarefa 3 - Análise da tendência da temperatura 
+ * Tarefa 4 - Controle NeoPixel baseado na tendência
  *
- * As tarefas são sincronizadas por flags globais.
- * O sistema utiliza watchdog para segurança (opcional) e
- * terminal USB para monitoramento.
+ * O sistema utiliza um repeating_timer para iniciar o ciclo
+ * de tarefas. As tarefas são executadas sequencialmente
+ * após a conclusão da Tarefa 1.
  *
- * Data: 12/05/2025
+ * MODIFICAÇÃO PRINCIPAL: O ciclo de execução das tarefas agora é
+ * disparado por uma flag (g_executar_ciclo_tarefas) que é
+ * ativada por um repeating_timer, em vez de um sleep_ms() fixo
+ * ao final do loop principal. Isso proporciona um início de ciclo
+ * mais preciso e desacopla o tempo de espera da execução das tarefas.
  * ------------------------------------------------------------
  */
 
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
-#include "hardware/timer.h"
-#include "pico/stdio_usb.h" // Para printf
+#include "hardware/timer.h"   // Para add_repeating_timer_ms
 
-#include "setup.h"
+#include "setup.h"           // Para cfg_temp e setup()
 #include "tarefa1_temp.h"
 #include "tarefa2_display.h"
 #include "tarefa3_tendencia.h"
 #include "tarefa4_controla_neopixel.h"
+#include "neopixel_driver.h"
+#include "testes_cores.h"
+#include "pico/stdio_usb.h" 
 
-// --- Variáveis Globais para Dados e Sincronização ---
-float g_media_temperatura;
-tendencia_t g_tendencia_atual;
+// Variáveis globais para dados entre tarefas e medição de tempo
+float media;
+tendencia_t t;
+absolute_time_t ini_tarefa1, fim_tarefa1, ini_tarefa2, fim_tarefa2, ini_tarefa3, fim_tarefa3, ini_tarefa4, fim_tarefa4;
 
-volatile bool g_flag_media_calculada = false;     // Sinaliza que T1 concluiu, média pronta para T3
-volatile bool g_flag_tendencia_analisada = false; // Sinaliza que T3 concluiu, tendência pronta para T2, T4 e print
-volatile bool g_flag_permitir_print = false;    // Sinaliza para o loop principal que pode imprimir dados novos
+// --- MODIFICAÇÃO: Flag global para ser acionada pelo repeating_timer ---
+// Esta flag controla quando o bloco principal de tarefas deve ser executado.
+volatile bool g_executar_ciclo_tarefas = false;
 
-// --- Configurações de DMA  ---
-extern dma_channel_config cfg_temp;
-
-// --- Objetos Timer ---
-static repeating_timer_t timer_t1;
-static repeating_timer_t timer_t2;
-static repeating_timer_t timer_t3;
-static repeating_timer_t timer_t4;
-
-// --- Protótipos dos Callbacks dos Timers ---
-bool timer_callback_tarefa1(repeating_timer_t *rt);
-bool timer_callback_tarefa2(repeating_timer_t *rt);
-bool timer_callback_tarefa3(repeating_timer_t *rt);
-bool timer_callback_tarefa4(repeating_timer_t *rt);
-
-// --- Timer callback para Tarefa 1: Leitura de Temperatura ---
-bool timer_callback_tarefa1(repeating_timer_t *rt) {
-    // Invalida flags de dados processados do ciclo anterior
-    g_flag_tendencia_analisada = false;
-    g_flag_permitir_print = false;
-
-    // Realiza a leitura da temperatura
-    g_media_temperatura = tarefa1_obter_media_temp(&cfg_temp, DMA_TEMP_CHANNEL);
-    
-    // Sinaliza que a nova média está pronta para a Tarefa 3
-    g_flag_media_calculada = true;
-    
-    return true; // Continua repetindo o timer
+// --- MODIFICAÇÃO: Callback do repeating_timer ---
+// Esta função é chamada pelo hardware timer em intervalos regulares.
+// Sua única responsabilidade é sinalizar que um novo ciclo de tarefas deve começar.
+bool repeating_timer_callback_principal(struct repeating_timer *timer) {
+    (void)timer; // Evita warning de parâmetro não usado se 'timer' não for utilizado no corpo.
+    g_executar_ciclo_tarefas = true; // Ativa a flag para o loop principal.
+    return true; // Retorna true para que o timer continue repetindo.
 }
 
-// --- Timer callback para Tarefa 3: Análise de Tendência ---
-bool timer_callback_tarefa3(repeating_timer_t *rt) {
-    if (g_flag_media_calculada) {
-        g_tendencia_atual = tarefa3_analisa_tendencia(g_media_temperatura);
-        
-        g_flag_media_calculada = false; // Consome a flag da média
-        g_flag_tendencia_analisada = true; // Sinaliza que a tendência está pronta
-        g_flag_permitir_print = true;      // Sinaliza para o loop principal imprimir
-    }
-    return true; 
-}
-
-// --- Timer callback para Tarefa 2: Exibição no OLED ---
-bool timer_callback_tarefa2(repeating_timer_t *rt) {
-    if (g_flag_tendencia_analisada) {
-        // g_media_temperatura e g_tendencia_atual são válidos aqui
-        tarefa2_exibir_oled(g_media_temperatura, g_tendencia_atual);
-    }
-    return true; 
-}
-
-// --- Timer callback para Tarefa 4: Controle NeoPixel ---
-bool timer_callback_tarefa4(repeating_timer_t *rt) {
-    if (g_flag_tendencia_analisada) {
-        // g_tendencia_atual é válida aqui
-        tarefa4_matriz_cor_por_tendencia(g_tendencia_atual);
-    }
-    return true; 
-}
-
+// Protótipos das funções que encapsulam as chamadas de tarefa originais
+// Essas "wrappers" ajudam a organizar o código e manter a lógica de medição de tempo.
+void executar_tarefa_1_leitura_temp(void);
+void executar_tarefa_2_analise_tendencia(void); 
+void executar_tarefa_3_display_oled(void);      
+void executar_tarefa_4_controle_neopixel(void);
+void executar_tarefa_5_extra_neopixel(void);
 
 int main() {
-    setup(); // Configurações iniciais de hardware, USB, DMA, etc.
+    setup(); // Chama a função de configuração inicial do hardware e periféricos.
 
-    // Ativa o watchdog com timeout de 2 segundos (opcional, descomentar se necessário)
-    // watchdog_enable(2000, 1);
-
-    // Configura e adiciona os timers para cada tarefa
-    // Todas as tarefas rodarão com um ciclo base de 1 segundo.
-    // A Tarefa 1 (leitura de temp) leva 0.5s para ser executada.
-    // As demais são mais rápidas e dependem das flags.
-    add_repeating_timer_ms(1000, timer_callback_tarefa1, NULL, &timer_t1);
-    add_repeating_timer_ms(1000, timer_callback_tarefa3, NULL, &timer_t3);
-    add_repeating_timer_ms(1000, timer_callback_tarefa2, NULL, &timer_t2);
-    add_repeating_timer_ms(1000, timer_callback_tarefa4, NULL, &timer_t4);
-
-    while (true) {
-        // watchdog_update(); // Atualiza o watchdog se estiver habilitado
-
-        if (g_flag_permitir_print) {
-            g_flag_permitir_print = false; // Consome a flag de impressão
-
-            // --- Exibição no terminal ---
-            // Nota: Os tempos de execução individuais (T2, T3, T4) são mais complexos
-            // de medir e reportar de forma sincronizada neste modelo com timers separados.
-            // Simplificamos o print para mostrar apenas os dados principais.
-            printf("Temperatura: %.2f C | Tendencia: %s\n",
-                   g_media_temperatura,
-                   tendencia_para_texto(g_tendencia_atual));
+    // --- MODIFICAÇÃO: Configuração do repeating_timer ---
+    struct repeating_timer timer_ciclo;
+    // Adiciona um timer que chama 'repeating_timer_callback_principal' a cada 1000 ms.
+    // O valor -1000 ms significa que o primeiro callback ocorrerá "imediatamente"
+    // (após a inicialização do timer) e depois a cada 1000ms.
+    // Se a função falhar ao adicionar o timer, imprime um erro e entra em loop infinito.
+    if (!add_repeating_timer_ms(-1000, repeating_timer_callback_principal, NULL, &timer_ciclo)) {
+        printf("Falha ao adicionar o timer principal!\n");
+        while(1) {
+            tight_loop_contents(); // Loop de erro simples.
         }
-        
-        tight_loop_contents(); 
     }
 
-    return 0; // Nunca alcançado
+    // --- MODIFICAÇÃO: Loop principal agora é orientado por flag ---
+    while (true) { // Loop infinito principal do programa.
+
+        // Verifica se a flag foi ativada pelo callback do timer.
+        if (g_executar_ciclo_tarefas) {
+            g_executar_ciclo_tarefas = false; // Reseta a flag para o próximo ciclo.
+
+            // Executa as tarefas sequencialmente.
+            executar_tarefa_1_leitura_temp();
+            executar_tarefa_5_extra_neopixel();
+            executar_tarefa_2_analise_tendencia(); 
+            executar_tarefa_3_display_oled();      
+            executar_tarefa_4_controle_neopixel();
+
+            // Calcula a duração de cada tarefa.
+            int64_t tempo1_us = absolute_time_diff_us(ini_tarefa1, fim_tarefa1);
+            int64_t tempo2_us = absolute_time_diff_us(ini_tarefa2, fim_tarefa2); 
+            int64_t tempo3_us = absolute_time_diff_us(ini_tarefa3, fim_tarefa3); 
+            int64_t tempo4_us = absolute_time_diff_us(ini_tarefa4, fim_tarefa4);
+
+            // Imprime os resultados e tempos no terminal serial USB.
+            printf("Temperatura: %.2f C | T1(Leitura): %.3fs | T_Disp: %.3fs | T_Tend: %.3fs | T_NeoP: %.3fs | Tend: %s\n",
+                   media,
+                   tempo1_us / 1e6,
+                   tempo2_us / 1e6, 
+                   tempo3_us / 1e6, 
+                   tempo4_us / 1e6,
+                   tendencia_para_texto(t));
+        } else {
+        }
+    }
+
+    return 0; 
+}
+
+void executar_tarefa_1_leitura_temp() {
+    ini_tarefa1 = get_absolute_time(); // Marca o início da tarefa.
+    // A variável 'cfg_temp' é global, definida em setup.c e declarada como extern em setup.h.
+    // tarefa1_obter_media_temp é bloqueante e leva aproximadamente 0.5 segundos.
+    media = tarefa1_obter_media_temp(&cfg_temp, DMA_TEMP_CHANNEL);
+    fim_tarefa1 = get_absolute_time(); // Marca o fim da tarefa.
+}
+
+void executar_tarefa_2_analise_tendencia() {
+    // Mede o tempo da tarefa de análise de tendência.
+    ini_tarefa3 = get_absolute_time();
+    t = tarefa3_analisa_tendencia(media); // Analisa a tendência com base na média da temperatura.
+    fim_tarefa3 = get_absolute_time();
+}
+
+void executar_tarefa_3_display_oled() {
+    // Mede o tempo da tarefa de exibição no OLED.
+    ini_tarefa2 = get_absolute_time();
+    tarefa2_exibir_oled(media, t); // Exibe a média e a tendência no display.
+    fim_tarefa2 = get_absolute_time();
+}
+
+void executar_tarefa_4_controle_neopixel() {
+    ini_tarefa4 = get_absolute_time();
+    tarefa4_matriz_cor_por_tendencia(t); // Controla a cor dos LEDs NeoPixel com base na tendência.
+    fim_tarefa4 = get_absolute_time();
+}
+
+void executar_tarefa_5_extra_neopixel() {
+    // Tarefa extra para controle dos NeoPixels se a temperatura for baixa.
+    // Os 'sleep_ms(100)' aqui pausam a execução de todas as outras atividades.
+    // Se esta tarefa for executada, o ciclo total será maior que 1 segundo.
+    if (media < 1.0f) { // Comparação de float com 1.0f.
+        npSetAll(COR_BRANCA); // COR_BRANCA definida em testes_cores.h
+        npWrite();
+        sleep_ms(100); // Pausa de 100ms.
+        npClear();
+        npWrite();
+        sleep_ms(100); // Pausa de 100ms.
+    }
 }
